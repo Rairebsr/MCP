@@ -4,18 +4,19 @@ import bodyParser from "body-parser";
 import 'dotenv/config';
 import { GoogleGenAI } from "@google/genai";
 import cors from "cors";
-
-
+import cookieParser from "cookie-parser";
 
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-
 app.use(cors({
     origin: "http://localhost:5173", // Only allows requests from your frontend URL
     methods: ["GET", "POST", "PUT", "DELETE"], // Allows necessary HTTP methods
     credentials: true // Important for cookies/authentication if you were using them
 }));
+app.use(cookieParser());
+
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+
 
 const CLIENT_ID = process.env.GITHUB_CLIENT_ID;
 const CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET;
@@ -51,38 +52,44 @@ app.get("/test", (req, res) => res.send("Server is running"));
 // OAuth callback
 app.get("/auth/callback", async (req, res) => {
   const code = req.query.code;
-  if (!code) return res.status(400).send("No code provided");
+  console.log("Callback:", code);
 
-  try {
-    const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Accept": "application/json" },
-      body: JSON.stringify({
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        code
-      })
-    });
+  const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      code
+    })
+  });
 
-    const data = await tokenRes.json();
-    const token = data.access_token;
-    console.log(token);
+  const data = await tokenRes.json();
+  const token = data.access_token;
 
-    if (!token) {
-  console.error("GitHub token exchange failed:", data);
-  return res.status(400).json({ error: "Failed to retrieve GitHub token", details: data });
-}
+  if (!token) return res.status(400).json({ error: "Bad code" });
 
-    res.redirect(`http://localhost:5173?token=${token}`);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Server error");
-  }
+  res.cookie("github_token", token, {
+    httpOnly: true,
+    secure: false,
+    sameSite: "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000
+  });
+
+  res.status(200).send("OK");
 });
+
+app.get("/debug/cookies", (req, res) => {
+  res.json(req.cookies);
+});
+
+
 
 // MCP Execute — forward to Git MCP Server
 app.post("/mcp/execute", async (req, res) => {
-  const { tool, args, token } = req.body; 
+  const { tool, args} = req.body; 
+
+  const token = req.cookies.github_token;
 
   if (!token) return res.status(401).json({ error: "Not logged in" });
 
@@ -110,62 +117,136 @@ app.post("/mcp/execute", async (req, res) => {
   }
 });
 
+function normalizeAction(action) {
+  if (!action) return null;
+  const a = action.toLowerCase().trim();
+
+  // Exact known mappings from Gemini style → internal style
+  if (a === "git.list_repos" || a === "list_repos") return "listRepos";
+  if (a === "git.create_repo" || a === "create_repo") return "createRepo";
+  if (a === "git.clone_repo" || a === "clone_repo") return "cloneRepo";
+
+  if (a === "docker.run" || a === "docker_run") return "dockerRun";
+  if (a === "docker.build" || a === "docker_build") return "dockerBuild";
+
+  // Fallback: loose matching (in case Gemini invents variants)
+  if (a.includes("list") && a.includes("repo")) return "listRepos";
+  if (a.includes("create") && a.includes("repo")) return "createRepo";
+  if (a.includes("clone") && a.includes("repo")) return "cloneRepo";
+  if (a.includes("docker") && a.includes("run")) return "dockerRun";
+  if (a.includes("docker") && a.includes("build")) return "dockerBuild";
+
+  return action; // as-is (might still match a switch case)
+}
+
+
 // ---- LLM Orchestrator (Gemini 2.5 Flash) ----
 app.post("/ask", async (req, res) => {
   console.log("Incoming request:", req.body);
-  const { query, token } = req.body;
-  if (!token) return res.status(401).json({ error: "Not logged in" });
+  const { query } = req.body;
+
+  const token = req.cookies.github_token;
+  console.log("token is:", token);
+
+  if (!token) {
+    return res.status(401).json({ reply: "⚠️ Not logged in. Please click 'Login with GitHub' first." });
+  }
 
   try {
-    // Step 1: Detect available servers
-    const availableServers = await checkAvailableServers(); // ['git', 'docker']
+    // 1️⃣ Check available MCP servers
+    const availableServers = await checkAvailableServers(); // e.g. ['git', 'docker']
     console.log("🛰️ Available servers:", availableServers);
 
-    // Step 2: Ask Gemini for next action
+    // 2️⃣ Ask Gemini what to do
     const contextualQuery = `
-You are an MCP Orchestrator. 
+You are an MCP Orchestrator.
+
 Available servers: ${availableServers.join(", ") || "None"}.
+
 User said: "${query}".
-Respond ONLY in JSON format like:
+
+You MUST respond ONLY as valid JSON like:
 {
   "action": "<actionName>",
   "parameters": { ... }
 }
-Where actionName can be: listRepos, createRepo, cloneRepo, dockerRun, dockerBuild, etc.
+
+Use these actionName values (exactly):
+- "listRepos"
+- "createRepo"
+- "cloneRepo"
+- "dockerRun"
+- "dockerBuild"
 `;
+
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash",
       contents: [{ parts: [{ text: contextualQuery }] }],
-      temperature: 0.7,
+      temperature: 0.2,
       candidateCount: 1,
     });
 
     console.log("🧠 Full Gemini response:", JSON.stringify(response, null, 2));
 
-    // Step 3: Extract and parse JSON safely
+    // 3️⃣ Extract raw text and parse JSON
     const rawText = response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    console.log("🧠 Raw Gemini text:", rawText);
+
     let geminiJSON;
-try {
-  const match = rawText.match(/\{[\s\S]*\}/);
-  geminiJSON = match ? JSON.parse(match[0]) : null;
-} catch (e) {
-  console.warn("⚠️ Could not parse Gemini JSON, sending raw text.");
-  return res.json({ reply: rawText });
-}
-
-if (!geminiJSON?.action) {
-  // fallback if action is missing
-  return res.json({ reply: rawText });
-}
-
+    try {
+      const match = rawText.match(/\{[\s\S]*\}/);
+      geminiJSON = match ? JSON.parse(match[0]) : null;
+    } catch (e) {
+      console.warn("⚠️ Could not parse Gemini JSON, sending raw text.");
+      return res.json({ reply: rawText });
+    }
 
     console.log("🧩 Parsed Gemini JSON:", geminiJSON);
+    // --- Normalize parameters Gemini gives --- //
+if (geminiJSON.parameters) {
+  
+  // repoName → name
+  if (geminiJSON.parameters.repoName && !geminiJSON.parameters.name) {
+    geminiJSON.parameters.name = geminiJSON.parameters.repoName;
+  }
 
-    // Step 4: Route action to MCP server
+  // repository → name
+  if (geminiJSON.parameters.repository && !geminiJSON.parameters.name) {
+    geminiJSON.parameters.name = geminiJSON.parameters.repository;
+  }
+
+  // projectName → name
+  if (geminiJSON.parameters.projectName && !geminiJSON.parameters.name) {
+    geminiJSON.parameters.name = geminiJSON.parameters.projectName;
+  }
+
+  // fallback: if user typed only single word, treat as repo name
+  if (!geminiJSON.parameters.name && query.split(" ").length === 1) {
+    geminiJSON.parameters.name = query.trim();
+  }
+}
+
+console.log("🔧 Normalized parameters:", geminiJSON.parameters);
+
+
+    if (!geminiJSON?.action) {
+      // If Gemini didn't give an action, just show its reply
+      return res.json({ reply: rawText });
+    }
+
+    // 🔁 Normalize the action name (fixes "git.list_repos" → "listRepos")
+    const normalizedAction = normalizeAction(geminiJSON.action);
+    console.log("🔧 Normalized action:", normalizedAction);
+
+    // 4️⃣ Route action to MCP server
     let mcpRes;
-    switch (geminiJSON.action) {
+
+    switch (normalizedAction) {
       case "listRepos":
-        if (!availableServers.includes("git")) throw new Error("Git server not available");
+        if (!availableServers.includes("git")) {
+          throw new Error("Git server not available");
+        }
+
         mcpRes = await fetch("http://localhost:4001/listRepos", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -174,7 +255,10 @@ if (!geminiJSON?.action) {
         break;
 
       case "createRepo":
-        if (!availableServers.includes("git")) throw new Error("Git server not available");
+        if (!availableServers.includes("git")) {
+          throw new Error("Git server not available");
+        }
+
         mcpRes = await fetch("http://localhost:4001/createRepo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -183,7 +267,10 @@ if (!geminiJSON?.action) {
         break;
 
       case "cloneRepo":
-        if (!availableServers.includes("git")) throw new Error("Git server not available");
+        if (!availableServers.includes("git")) {
+          throw new Error("Git server not available");
+        }
+
         mcpRes = await fetch("http://localhost:4001/cloneRepo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -193,25 +280,37 @@ if (!geminiJSON?.action) {
 
       case "dockerRun":
       case "dockerBuild":
-        if (!availableServers.includes("docker")) throw new Error("Docker server not available");
-        mcpRes = await fetch(`http://localhost:4002/docker/exec`, {
+        if (!availableServers.includes("docker")) {
+          throw new Error("Docker server not available");
+        }
+
+        mcpRes = await fetch("http://localhost:4002/docker/exec", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: geminiJSON.action, ...geminiJSON.parameters }),
+          body: JSON.stringify({ command: normalizedAction, ...geminiJSON.parameters }),
         }).then((r) => r.json());
         break;
 
       default:
-        // fallback: send Gemini text as reply
+        // If it's some unknown action, return raw Gemini text
         return res.json({ reply: rawText });
     }
 
-    // Step 5: Send MCP response to frontend
-    res.json({ reply: JSON.stringify(mcpRes, null, 2) });
+    console.log("📦 MCP Response:", mcpRes);
+
+    // 5️⃣ Send CLEAN reply to frontend (not raw JSON)
+    const cleanReply =
+      mcpRes?.content?.[0]?.text ||      // our structured tool format
+      mcpRes?.message ||                 // simple message
+      JSON.stringify(mcpRes, null, 2);   // fall back (debug style)
+
+    return res.json({ reply: cleanReply });
 
   } catch (err) {
     console.error("❌ Orchestrator failed:", err);
-    res.status(500).json({ error: "Orchestrator failed", details: err.message });
+    return res.status(500).json({
+      reply: `❌ Orchestrator failed: ${err.message}`,
+    });
   }
 });
 

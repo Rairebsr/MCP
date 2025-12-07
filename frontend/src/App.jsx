@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 
 const App = () => {
@@ -10,64 +12,33 @@ const App = () => {
   const [tools, setTools] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const messagesEndRef = useRef(null);
-  const [githubToken, setGithubToken] = useState(null);
 
 useEffect(() => {
-  const storedToken = localStorage.getItem("github_token");
-  console.log(storedToken);
-  if (storedToken) {
-    setGithubToken(storedToken);
+  const url = new URL(window.location.href);
+  const code = url.searchParams.get("code");
+
+  if (code && !window.__handledAuth) {   // <-- fix
+    window.__handledAuth = true;         // <-- fix
+
+    fetch(`/api/auth/callback?code=${code}`, {
+      method: "GET",
+      credentials: "include"
+    }).finally(() => {
+      url.searchParams.delete("code");
+      window.history.replaceState({}, "", url.pathname);
+    });
   }
 }, []);
 
-useEffect(() => {
-  const params = new URLSearchParams(window.location.search);
-  const token = params.get("token");
-  if (token) {
-    localStorage.setItem("github_token", token);
-    setGithubToken(token);
-    window.history.replaceState({}, document.title, "/");
-  }
-}, []);
-
-useEffect(() => {
-  const storedToken = localStorage.getItem("github_token");
-  if (storedToken) {
-    setGithubToken(storedToken);
-    return;
-  }
-
-  // Check if GitHub redirected back with a ?code= param
-  const urlParams = new URLSearchParams(window.location.search);
-  const code = urlParams.get("code");
-
-  if (code) {
-    // Exchange the code for an access token via your backend
-    fetch("http://localhost:4000/auth/github/callback", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    })
-      .then(res => res.json())
-      .then(data => {
-        if (data.access_token) {
-          localStorage.setItem("github_token", data.access_token);
-          setGithubToken(data.access_token);
-          // Clean the URL
-          window.history.replaceState({}, document.title, "/");
-        }
-      })
-      .catch(err => console.error("GitHub auth failed:", err));
-  }
-}, []);
 
 
 const callOrchestrator = async (query, token) => {
-  const response = await fetch("http://localhost:4000/ask", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, token })
-  });
+  const response = await fetch("/api/ask", {
+  method: "POST",
+  credentials: "include",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ query })
+});
 
   const data = await response.json();
 
@@ -150,7 +121,7 @@ const callOrchestrator = async (query, token) => {
   setIsProcessing(true);
 
   try {
-    const response = await callOrchestrator(inputValue, githubToken);
+    const response = await callOrchestrator(inputValue);
 
     const aiMessage = {
       id: Date.now() + 1,
@@ -328,7 +299,11 @@ const callOrchestrator = async (query, token) => {
             <div className="flex-1 overflow-y-auto p-6" style={{ maxHeight: 'calc(100vh - 200px)' }}>
               {messages.map((message) => (
                 <div key={message.id} className="flex flex-col mb-2">
-                  <div className={getMessageStyles(message.type)}>{message.content}</div>
+                  <div className={getMessageStyles(message.type)}>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {message.content}
+                    </ReactMarkdown>
+                  </div>
                   <div
                     className={`text-xs text-gray-500 mt-1 ${
                       message.type === 'user' ? 'text-right mr-2' : 'ml-2'

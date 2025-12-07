@@ -4,31 +4,30 @@ import { exec } from "child_process";
 import bodyParser from "body-parser";
 import util from "util";
 import 'dotenv/config';
+import cookieParser from "cookie-parser";
+
 
 const app = express();
 const execPromise = util.promisify(exec);
 app.use(bodyParser.json());
+app.use(cookieParser());
 
 const GITHUB_API = "https://api.github.com";
 
 // 🧩 Middleware to validate GitHub token
 app.use((req, res, next) => {
-  if (req.method === "POST" && !req.body?.token) {
-    return res.status(401).json({ error: "GitHub token missing" });
-  }
+  const token = req.cookies.github_token;
+  req.githubToken = token || null;
   next();
-});
-
-
-app.get("/status", (req, res) => {
-  res.json({ ok: true, service: "Git MCP", status: "running" });
 });
 
 
 // 🧭 1️⃣ List repositories of the authenticated user
 // 🧭 1️⃣ List repositories of the authenticated user (Gemini-style response)
 app.post("/listRepos", async (req, res) => {
-  const { token } = req.body;
+  const token = req.body.token; // FIXED: use body, not req.githubToken
+  if (!token) return res.status(401).json({ error: "GitHub token missing" });
+
   try {
     const ghRes = await fetch(`${GITHUB_API}/user/repos`, {
       headers: {
@@ -36,27 +35,30 @@ app.post("/listRepos", async (req, res) => {
         Accept: "application/vnd.github+json",
       },
     });
-    const repos = await ghRes.json();
-    if (!Array.isArray(repos))
-      throw new Error(repos.message || "Invalid GitHub response");
 
-    // 🪶 Gemini-style structured formatting
-    const formattedList = repos
-      .map(
-        (r, idx) =>
-          `**${idx + 1}. ${r.name}**  
-   🔗 [Repo URL](${r.html_url})  
-   🕒 Updated: ${new Date(r.updated_at).toLocaleString()}  
-   🔒 Private: ${r.private ? "Yes" : "No"}`
-      )
-      .join("\n\n");
+    const repos = await ghRes.json();
+    if (!Array.isArray(repos)) {
+      throw new Error(repos.message || "Invalid GitHub response");
+    }
+
+    // Build markdown table
+    const header = `### 📁 Your GitHub Repositories (${repos.length} total)\n\n`;
+    const tableHeader = `| # | Repository | Visibility | Updated | URL |\n|---|------------|-----------|---------|-----|\n`;
+
+    const rows = repos
+      .map((r, i) => {
+        return `| ${i + 1} | ${r.name} | ${r.private ? "🔒 Private" : "🌐 Public"} | ${new Date(r.updated_at).toLocaleDateString()} | ${r.html_url} |`;
+      })
+      .join("\n");
+
+    const markdown = header + tableHeader + rows;
 
     res.json({
       role: "assistant",
       content: [
         {
           type: "text",
-          text: `Here are your repositories (${repos.length} total):\n\n${formattedList}`,
+          text: markdown,
         },
       ],
       success: true,
@@ -78,7 +80,11 @@ app.post("/listRepos", async (req, res) => {
 
 // 🧭 2️⃣ Create a new repository
 app.post("/createRepo", async (req, res) => {
-  const { token, name, description = "", privateRepo = false } = req.body;
+  const token = req.body.token;
+
+  const { name, description = "", privateRepo = false } = req.body;
+
+  if (!token) return res.status(401).json({ error: "GitHub token missing" });
 
   if (!name) return res.status(400).json({ error: "Repository name required" });
 
