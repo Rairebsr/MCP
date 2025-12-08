@@ -7,6 +7,10 @@ import cors from "cors";
 import cookieParser from "cookie-parser";
 
 const app = express();
+// 🔹 Short-term memory storage per session cookie
+const sessionMemory = {};   // { sessionId: [ {role, text}, ... ] }
+
+//MIDDLEWARES
 app.use(cors({
     origin: "http://localhost:5173", // Only allows requests from your frontend URL
     methods: ["GET", "POST", "PUT", "DELETE"], // Allows necessary HTTP methods
@@ -16,6 +20,28 @@ app.use(cookieParser());
 
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+
+app.use((req, res, next) => {
+  if (!req.cookies.session_id) {
+    const newSession = Math.random().toString(36).substring(2);
+    res.cookie("session_id", newSession, {
+      httpOnly: false,     // frontend must read it
+      sameSite: "lax",
+      secure: false
+    });
+    req.session_id = newSession;
+  } else {
+    req.session_id = req.cookies.session_id;
+  }
+
+  // Ensure memory exists
+  if (!sessionMemory[req.session_id]) {
+    sessionMemory[req.session_id] = [];
+  }
+
+  next();
+});
+
 
 
 const CLIENT_ID = process.env.GITHUB_CLIENT_ID;
@@ -140,10 +166,70 @@ function normalizeAction(action) {
 }
 
 
+function formatConversationalReply(action, mcpRes, query, parameters = {}) {
+
+  // GitHub error patterns
+  const errorMsg = mcpRes?.error || mcpRes?.message;
+
+  // Handle missing name
+  if (action === "createRepo" && errorMsg?.includes("required")) {
+    return `You asked me to create a repository, but I couldn't find the name.  
+Please tell me what name you'd like. 😊`;
+  }
+
+  // Handle existing repo
+  if (errorMsg?.includes("name already exists")) {
+    return `A repository with this name already exists on your GitHub account.  
+Try choosing a different name.`;
+  }
+
+  // Invalid name
+  if (errorMsg?.includes("invalid") && errorMsg?.includes("name")) {
+    return `That repository name is invalid according to GitHub’s rules.  
+Names can contain letters, numbers, hyphens, and must not be empty.`;
+  }
+
+  // Bad credentials
+  if (errorMsg?.includes("Bad credentials")) {
+    return `Your GitHub login seems expired or invalid.  
+Please click **Login with GitHub** again.`;
+  }
+
+  // Rate limits
+  if (errorMsg?.includes("rate limit")) {
+    return `GitHub rate limits were exceeded.  
+Please wait a few minutes and try again.`;
+  }
+
+  // Generic errors
+  if (errorMsg) {
+    return `⚠️ Something went wrong:  
+${errorMsg}`;
+  }
+
+  // Success - create repo
+  if (action === "createRepo" && mcpRes?.success) {
+    return `🎉 Your repository **${mcpRes.repo.name}** has been created successfully!  
+You can view it here: ${mcpRes.repo.url}`;
+  }
+
+  // Success - list repos
+  if (action === "listRepos" && mcpRes?.content?.[0]?.text) {
+    return `Here are your repositories:\n\n${mcpRes.content[0].text}`;
+  }
+
+  // Fallback
+  return JSON.stringify(mcpRes, null, 2);
+}
+
+
 // ---- LLM Orchestrator (Gemini 2.5 Flash) ----
 app.post("/ask", async (req, res) => {
   console.log("Incoming request:", req.body);
+  // Save conversation
+  
   const { query } = req.body;
+  sessionMemory[req.session_id].push({ role: "user", text: query });
 
   const token = req.cookies.github_token;
   console.log("token is:", token);
@@ -157,11 +243,18 @@ app.post("/ask", async (req, res) => {
     const availableServers = await checkAvailableServers(); // e.g. ['git', 'docker']
     console.log("🛰️ Available servers:", availableServers);
 
+    const past = sessionMemory[req.session_id]
+    .map(m => `${m.role}: ${m.text}`)
+    .join("\n");
+
     // 2️⃣ Ask Gemini what to do
     const contextualQuery = `
 You are an MCP Orchestrator.
 
 Available servers: ${availableServers.join(", ") || "None"}.
+
+Here is the conversation history:
+${past}
 
 User said: "${query}".
 
@@ -299,10 +392,15 @@ console.log("🔧 Normalized parameters:", geminiJSON.parameters);
     console.log("📦 MCP Response:", mcpRes);
 
     // 5️⃣ Send CLEAN reply to frontend (not raw JSON)
-    const cleanReply =
-      mcpRes?.content?.[0]?.text ||      // our structured tool format
-      mcpRes?.message ||                 // simple message
-      JSON.stringify(mcpRes, null, 2);   // fall back (debug style)
+    const cleanReply = formatConversationalReply(
+      normalizedAction,
+      mcpRes,
+      query,
+      geminiJSON.parameters
+    );
+
+    //saving assistant response
+    sessionMemory[req.session_id].push({ role: "assistant", text: cleanReply });
 
     return res.json({ reply: cleanReply });
 
