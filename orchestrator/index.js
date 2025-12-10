@@ -10,6 +10,7 @@ const app = express();
 // 🔹 Short-term memory storage per session cookie
 const sessionMemory = {};   // { sessionId: [ {role, text}, ... ] }
 
+
 //MIDDLEWARES
 app.use(cors({
     origin: "http://localhost:5173", // Only allows requests from your frontend URL
@@ -75,6 +76,40 @@ async function checkAvailableServers() {
 
 app.get("/test", (req, res) => res.send("Server is running"));
 
+// Auth status - tells the frontend if a valid token exists and returns basic GitHub user info
+app.get("/auth/status", async (req, res) => {
+  const token = req.cookies.github_token;
+  if (!token) return res.json({ loggedIn: false });
+
+  try {
+    const ghRes = await fetch("https://api.github.com/user", {
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "MCP-Orchestrator"
+      }
+    });
+
+    if (ghRes.status === 401 || ghRes.status === 403) {
+      // token invalid or expired
+      res.clearCookie("github_token");
+      return res.json({ loggedIn: false });
+    }
+
+    const user = await ghRes.json();
+    return res.json({
+      loggedIn: true,
+      login: user.login,
+      name: user.name,
+      avatar_url: user.avatar_url,
+      id: user.id
+    });
+  } catch (err) {
+    console.error("/auth/status error:", err);
+    return res.status(500).json({ loggedIn: false, error: err.message });
+  }
+});
+
 // OAuth callback
 app.get("/auth/callback", async (req, res) => {
   const code = req.query.code;
@@ -96,13 +131,16 @@ app.get("/auth/callback", async (req, res) => {
   if (!token) return res.status(400).json({ error: "Bad code" });
 
   res.cookie("github_token", token, {
-    httpOnly: true,
-    secure: false,
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000
-  });
+  httpOnly: true,
+  sameSite: "lax",
+  secure: false, // true if deploying over HTTPS
+  maxAge: 24 * 60 * 60 * 1000,
+});
 
-  res.status(200).send("OK");
+  const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+  const redirectUrl = `${FRONTEND_URL}?authed=1`;
+  return res.redirect(302, redirectUrl);
+
 });
 
 app.get("/debug/cookies", (req, res) => {
@@ -110,6 +148,48 @@ app.get("/debug/cookies", (req, res) => {
 });
 
 
+
+app.post("/auth/logout", async (req, res) => {
+  try {
+    const token = req.cookies.github_token;
+    // clear cookie in all cases
+    res.clearCookie("github_token");
+
+    if (token) {
+      // Revoke app grant for the token using GitHub OAuth API.
+      // This endpoint requires Basic auth with client_id:client_secret.
+      // NOTE: This API removes the grant for the entire application for that user.
+      const basicAuth = Buffer.from(`${process.env.GITHUB_CLIENT_ID}:${process.env.GITHUB_CLIENT_SECRET}`).toString("base64");
+
+      const revokeRes = await fetch(
+        `https://api.github.com/applications/${process.env.GITHUB_CLIENT_ID}/grant`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Basic ${basicAuth}`,
+            Accept: "application/vnd.github+json",
+            "User-Agent": "MCP-Orchestrator"
+          },
+          body: JSON.stringify({ access_token: token })
+        }
+      );
+
+      // GitHub returns 204 on success
+      if (revokeRes.status === 204) {
+        console.log("GitHub grant revoked successfully");
+      } else {
+        console.warn("GitHub revoke returned", revokeRes.status);
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("logout error:", err);
+    // still clear cookie and return OK to frontend
+    res.clearCookie("github_token");
+    return res.status(200).json({ ok: true, error: err.message });
+  }
+});
 
 // MCP Execute — forward to Git MCP Server
 app.post("/mcp/execute", async (req, res) => {
