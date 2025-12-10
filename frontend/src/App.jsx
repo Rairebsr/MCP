@@ -12,24 +12,84 @@ const App = () => {
   const [tools, setTools] = useState([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const messagesEndRef = useRef(null);
+  const [user, setUser] = useState(null);
 
 useEffect(() => {
+  console.log("[auth] useEffect mount; url:", window.location.href);
   const url = new URL(window.location.href);
-  const code = url.searchParams.get("code");
 
-  if (code && !window.__handledAuth) {   // <-- fix
-    window.__handledAuth = true;         // <-- fix
-
-    fetch(`/api/auth/callback?code=${code}`, {
-      method: "GET",
-      credentials: "include"
-    }).finally(() => {
-      url.searchParams.delete("code");
-      window.history.replaceState({}, "", url.pathname);
-    });
+  const authed = url.searchParams.get("authed");
+  if (authed) {
+    url.searchParams.delete("authed");
+    window.history.replaceState({}, "", url.pathname + url.search);
+    fetchAuthStatus();
+    return;
   }
+
+  const code = url.searchParams.get("code");
+  if (code && !window.__handledAuth) {
+    window.__handledAuth = true;
+    fetch(`http://localhost:4000/auth/callback?code=${code}`, { method: "GET", credentials: "include" })
+      .finally(async () => {
+        url.searchParams.delete("code");
+        window.history.replaceState({}, "", url.pathname);
+        await fetchAuthStatus();
+      });
+    return;
+  }
+
+  fetchAuthStatus();
 }, []);
 
+
+const fetchAuthStatus = async () => {
+  console.log("[auth] fetchAuthStatus: start");
+  try {
+    const res = await fetch("http://localhost:4000/auth/status", { credentials: "include" });
+    console.log("[auth] /auth/status response status:", res.status);
+    const data = await res.json().catch(e => {
+      console.error("[auth] failed to parse /auth/status json", e);
+      return null;
+    });
+    console.log("[auth] /auth/status payload:", data);
+    if (data && data.loggedIn) {
+      setUser({ login: data.login, avatar_url: data.avatar_url, name: data.name });
+      console.log("[auth] setUser ->", data.login);
+    } else {
+      setUser(null);
+      console.log("[auth] not logged in (set user null)");
+    }
+  } catch (err) {
+    console.error("[auth] fetchAuthStatus error", err);
+    setUser(null);
+  }
+};
+
+
+  useEffect(() => {
+    console.log("[auth] useEffect mount; url:", window.location.href);
+    const url = new URL(window.location.href);
+    const code = url.searchParams.get("code");
+
+    if (code && !window.__handledAuth) {
+      window.__handledAuth = true;
+
+      // IMPORTANT: call the backend callback endpoint that exchanges code -> token
+      // your backend route is /auth/callback (not /api/auth/callback)
+      fetch(`http://localhost:4000/auth/callback?code=${code}`, 
+        { method: "GET", credentials: "include" })
+
+        .finally(async () => {
+          // remove code from URL and refresh auth status
+          url.searchParams.delete("code");
+          window.history.replaceState({}, "", url.pathname);
+          await fetchAuthStatus();
+        });
+    } else {
+      // normal mount: check if already logged in
+      fetchAuthStatus();
+    }
+  }, []);
 
 
 const callOrchestrator = async (query, token) => {
@@ -284,15 +344,48 @@ const callOrchestrator = async (query, token) => {
               <h2 className="text-2xl font-bold bg-gradient-to-r from-blue-500 to-green-500 bg-clip-text text-transparent">
                 MCP Orchestrator
               </h2>
-              <button
-                  onClick={() => {
-                    window.location.href = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&scope=repo,user`;
-                  }}
-                  className="bg-orange-500 text-white px-3 py-2 rounded-lg text-sm font-medium hover:bg-orange-600 transition"
-                >
-                  Login with GitHub
-              </button>
-            </div>
+               {/* AUTH AREA */}
+              <div className="flex items-center space-x-3">
+                {user ? (
+                  <>
+                    <div className="flex items-center space-x-2">
+                      {user.avatar_url && (
+                        <img
+                          src={user.avatar_url}
+                          alt="avatar"
+                          className="w-8 h-8 rounded-full"
+                        />
+                      )}
+
+                      <div className="text-sm text-right">
+                        <div className="font-medium">Logged in as</div>
+                        <div className="truncate max-w-[10rem]">{user.login || user.name}</div>
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={async () => {
+                        await fetch("http://localhost:4000/auth/logout", { method: "POST", credentials: "include" });
+                        await fetchAuthStatus();
+                      }}
+                      className="bg-red-600 text-white px-3 py-2 rounded-lg text-sm font-medium hover:bg-red-700 transition"
+                    >
+                      Logout
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => {
+                      window.location.href = `https://github.com/login/oauth/authorize?client_id=${GITHUB_CLIENT_ID}&scope=repo,user`;
+                    }}
+                    className="bg-orange-500 text-white px-3 py-2 rounded-lg text-sm font-medium hover:bg-orange-600 transition"
+                  >
+                    Login with GitHub
+                  </button>
+                )}
+  </div>
+  {/* end AUTH AREA */}
+</div>
           </div>
           
           <div className="flex-1 flex flex-col overflow-hidden">
